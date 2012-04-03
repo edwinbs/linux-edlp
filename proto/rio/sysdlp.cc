@@ -8,141 +8,83 @@
  */
 
 #include "dr_api.h"
-#include "drmgr.h"
 #include <string.h>
 #include <syscall.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <string>
+#include <stdint.h>
 
 using namespace std;
 
 # define DISPLAY_STRING(msg) dr_printf("%s\n", msg);
 # define ATOMIC_INC(var) __asm__ __volatile__("lock incl %0" : "=m" (var) : : "memory")
 
-# define SYS_MAX_ARGS 3
+/* Shadow memory (32-bit) */
+/* 64K blocks of 64KB each. shblk[] contain the pointer to the real blocks. */
+/* Note that the block pointers consume (64 * 4 = 256) KB */
+static uint8_t* shblk[0xffff];
 
-/* Thread-context-local data structure for storing system call
- * parameters.  Since this state spans application system call
- * execution, thread-local data is not sufficient on Windows: we need
- * thread-context-local, or "callback-local", provided by the drmgr
- * extension.
- */
-typedef struct {
-    reg_t param[SYS_MAX_ARGS];
-    bool repeat;
-} per_thread_t;
-
-/* Thread-context-local storage index from drmgr */
-static int tcls_idx;
-
-/* The system call number of SYS_write/NtWriteFile */
-static int open_sysnum;
-
-static int num_syscalls;
+/* Shadow of IA32 General Purpose Registers */
+static uint8_t shgpr[8];
 
 static bool is_tainted;
 
-static int get_open_sysnum(void);
 static void event_exit(void);
-static void event_thread_context_init(void *drcontext, bool new_depth);
-static void event_thread_context_exit(void *drcontext, bool process_exit);
 static bool event_filter_syscall(void *drcontext, int sysnum);
 static bool event_pre_syscall(void *drcontext, int sysnum);
 static void event_post_syscall(void *drcontext, int sysnum);
+static dr_emit_flags_t event_basic_block(void *drcontext, void *tag, instrlist_t *bb,
+                                         bool for_trace, bool translating);
 
 DR_EXPORT void 
 dr_init(client_id_t id)
 {
-    drmgr_init();
-    open_sysnum = get_open_sysnum();
     dr_register_filter_syscall_event(event_filter_syscall);
-    drmgr_register_pre_syscall_event(event_pre_syscall);
+    dr_register_pre_syscall_event(event_pre_syscall);
     dr_register_post_syscall_event(event_post_syscall);
     dr_register_exit_event(event_exit);
-    tcls_idx = drmgr_register_cls_field(event_thread_context_init,
-                                        event_thread_context_exit);
-    DR_ASSERT(tcls_idx != -1);
-#ifdef SHOW_RESULTS
-    if (dr_is_notify_on()) {
-        //dr_fprintf(STDERR, "DLP is monitoring system calls\n");
-    }
-#endif
-}
-
-static void 
-show_results(void)
-{
-#ifdef SHOW_RESULTS
-    char msg[512];
-    int len;
-    /* Note that using %f with dr_printf or dr_fprintf on Windows will print
-     * garbage as they use ntdll._vsnprintf, so we must use dr_snprintf.
-     */
-    len = dr_snprintf(msg, sizeof(msg)/sizeof(msg[0]),
-                      "<Number of system calls seen: %d>", num_syscalls);
-    DR_ASSERT(len > 0);
-    msg[sizeof(msg)/sizeof(msg[0])-1] = '\0';
-    DISPLAY_STRING(msg);
-#endif /* SHOW_RESULTS */
+    dr_register_bb_event(event_basic_block);
+    
+    memset(shblk, 0, 0xffff * sizeof(uint8_t*));
 }
 
 static void 
 event_exit(void)
 {
-    //show_results();
-    drmgr_unregister_cls_field(event_thread_context_init,
-                               event_thread_context_exit,
-                               tcls_idx);
-    drmgr_exit();
-}
-
-static void
-event_thread_context_init(void *drcontext, bool new_depth)
-{
-    /* create an instance of our data structure for this thread context */
-    per_thread_t *data;
-    /*
-#ifdef SHOW_RESULTS
-    dr_fprintf(STDERR, "new thread context id=%d%s\n", dr_get_thread_id(drcontext),
-               new_depth ? " new depth" : "");
-#endif
-*/
-    if (new_depth) {
-        data = (per_thread_t *) dr_thread_alloc(drcontext, sizeof(per_thread_t));
-        drmgr_set_cls_field(drcontext, tcls_idx, data);
-    } else
-        data = (per_thread_t *) drmgr_get_cls_field(drcontext, tcls_idx);
-    memset(data, 0, sizeof(*data));
-}
-
-static void 
-event_thread_context_exit(void *drcontext, bool thread_exit)
-{
-/*
-#ifdef SHOW_RESULTS
-    dr_fprintf(STDERR, "resuming prior thread context id=%d\n",
-               dr_get_thread_id(drcontext));
-#endif
-*/
-    if (thread_exit) {
-        per_thread_t *data = (per_thread_t *) drmgr_get_cls_field(drcontext, tcls_idx);
-        dr_thread_free(drcontext, data, sizeof(per_thread_t));
+    dr_fprintf(STDERR, "Tainted locations:\n");
+    for (uint16_t hi=0; hi<0xffff; ++hi)
+    {
+        if (!shblk[hi]) continue;
+        
+        //dr_fprintf(STDERR, "0x%04x____\n", hi);
+        for (uint16_t lo=0; lo<0xffff; ++lo)
+        {
+            if (shblk[hi][lo])
+                dr_fprintf(STDERR, "0x%04x%04x\n", hi, lo);
+        }
     }
-    /* else, nothing to do: we leave the struct for re-use on next context */
 }
 
 static bool
 event_filter_syscall(void *drcontext, int sysnum)
 {
-    return (sysnum == open_sysnum);
+    switch (sysnum)
+    {
+    case SYS_open:
+    case SYS_read:
+    case SYS_write:
+    case SYS_close:
+        return true;
+    }
+    
+    return false;
 }
 
 static bool
 is_external(const string& sFileName)
 {
-    return (sFileName.find("/media/") != string::npos ||
-            sFileName.find("external") != string::npos);
+    return (sFileName.find("/media/") != string::npos);
 }
 
 static bool
@@ -156,29 +98,47 @@ on_open(const string& sFileName, bool bWrite)
 
     if (sFileName.find("confidential") != string::npos)
     {
-        //dr_fprintf(STDERR, "[DLP] Process %u is tainted\n", getpid());
         is_tainted = true;
     }
         
     return true;
 }
 
+static void
+post_read(int fd, void* buf, size_t count, ssize_t bytes_read)
+{
+    if (is_tainted)
+    {
+        printf("Tainted load % 4d bytes to 0x%08x\n",
+            bytes_read, (uint32_t) buf);
+            
+        for (ssize_t i = 0; i < bytes_read; ++i)
+        {
+            uint32_t addr = (uint32_t) buf + i;
+            uint16_t hi   = (addr >> 16) & 0xffff;
+            uint16_t lo   = (addr & 0xffff);
+            
+            if (!shblk[hi]) /* shadow block has not been allocated */
+            {
+                shblk[hi] = (uint8_t*) malloc(0xffff * sizeof(uint8_t));
+                memset(shblk[hi], 0, 0xffff * sizeof(uint8_t));
+            }
+                
+            uint8_t* shadow_ptr = &((shblk[hi])[lo]);
+            *shadow_ptr = 1;
+        }
+    }
+}
+
 static bool
 event_pre_syscall(void *drcontext, int sysnum)
 {
-    if (sysnum == open_sysnum)
+    if (sysnum == SYS_open)
     {
         const char* szFileName = (const char*) dr_syscall_get_param(drcontext, 0);
         int flags = (int) dr_syscall_get_param(drcontext, 1);
         bool bWrite = (flags & O_WRONLY) | (flags & O_RDWR);
-        /*
-#ifdef SHOW_RESULTS
-    dr_fprintf(STDERR, "open(\"%s\", 0x%x, 0x%x)\n",
-               dr_syscall_get_param(drcontext, 0),
-               dr_syscall_get_param(drcontext, 1),
-               dr_syscall_get_param(drcontext, 2));
-#endif
-*/
+        
         return on_open(szFileName, bWrite);
     }
     
@@ -188,10 +148,20 @@ event_pre_syscall(void *drcontext, int sysnum)
 static void
 event_post_syscall(void *drcontext, int sysnum)
 {
+    if (sysnum == SYS_read)
+    {
+        int fd = (int) dr_syscall_get_param(drcontext, 0);
+        void* buf = (void*) dr_syscall_get_param(drcontext, 1);
+        size_t count = (size_t) dr_syscall_get_param(drcontext, 2);
+        ssize_t bytes_read = (ssize_t) dr_syscall_get_result(drcontext);
+        
+        post_read(fd, buf, count, bytes_read);
+    }
 }
 
-static int
-get_open_sysnum(void)
+static dr_emit_flags_t
+event_basic_block(void *drcontext, void *tag, instrlist_t *bb,
+                  bool for_trace, bool translating)
 {
-    return SYS_open;
+    return DR_EMIT_DEFAULT;
 }

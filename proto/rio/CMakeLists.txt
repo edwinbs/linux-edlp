@@ -16,5 +16,4 @@ endif(NOT DynamoRIO_FOUND)
 
 # sysdlp: syscall DLP hooks
 add_library(sysdlp SHARED sysdlp.cc)
-use_DynamoRIO_extension(sysdlp drmgr)
 configure_DynamoRIO_client(sysdlp)
