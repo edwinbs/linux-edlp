@@ -104,6 +104,19 @@ on_open(const string& sFileName, bool bWrite)
     return true;
 }
 
+inline static uint8_t* get_shadow_ptr(uint32_t addr)
+{
+    uint8_t** shadow_pp = &shblk[(addr >> 16) & 0xffff];
+    
+    if (!(*shadow_pp)) /* shadow block has not been allocated */
+    {
+        *shadow_pp = (uint8_t*) malloc(0xffff * sizeof(uint8_t));
+        memset(*shadow_pp, 0, 0xffff * sizeof(uint8_t));
+    }
+        
+    return &((*shadow_pp)[(addr & 0xffff)]);
+}
+
 static void
 post_read(int fd, void* buf, size_t count, ssize_t bytes_read)
 {
@@ -113,18 +126,8 @@ post_read(int fd, void* buf, size_t count, ssize_t bytes_read)
             bytes_read, (uint32_t) buf);
             
         for (ssize_t i = 0; i < bytes_read; ++i)
-        {
-            uint32_t addr = (uint32_t) buf + i;
-            uint16_t hi   = (addr >> 16) & 0xffff;
-            uint16_t lo   = (addr & 0xffff);
-            
-            if (!shblk[hi]) /* shadow block has not been allocated */
-            {
-                shblk[hi] = (uint8_t*) malloc(0xffff * sizeof(uint8_t));
-                memset(shblk[hi], 0, 0xffff * sizeof(uint8_t));
-            }
-                
-            uint8_t* shadow_ptr = &((shblk[hi])[lo]);
+        {       
+            uint8_t* shadow_ptr = get_shadow_ptr((uint32_t) buf + i);
             *shadow_ptr = 1;
         }
     }
