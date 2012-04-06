@@ -12,6 +12,12 @@
 *~
 *.preload
 *.log
+*#*
+*.txt
+CMakeFiles/
+build/
+bin/
+*.cmake
 
 # Compiled Dynamic libraries
 *.so
