@@ -14,7 +14,7 @@
 #include <fcntl.h>
 #include <string>
 #include <stdint.h>
-#include <vector>
+#include <set>
 #include "logger.h"
 #include "persistence.h"
 
@@ -26,23 +26,26 @@ using namespace std;
 
 struct SThreadData
 {
-  Logger m_logger;
-  bool m_bTainted;
+    Logger m_logger;
+    bool m_bTainted;
+    reg_t* m_rgArgs;
 
-  SThreadData()
-    : m_bTainted(false) {
-    m_logger.Initialize(LOGGER_FILE);
-  }
+    SThreadData()
+	: m_bTainted(false)
+	, m_rgArgs(NULL)
+    {
+	//m_logger.Initialize(LOGGER_FILE);
+    }
 };
 
 // The index for thread local storage
 static int tlsIdx;
 // List of tainted files loaded in the process; any buffers loaded from these files will be marked tainted
-static std::vector<int> taintedFiles;
+static std::set<int> taintedFiles;
 /* Shadow memory (32-bit) */
 /* 64K blocks of 64KB each. shblk[] contain the pointer to the real blocks. */
 /* Note that the block pointers consume (64 * 4 = 256) KB */
-static uint8_t* shblk[0xffff];
+static uint8_t** shblk = NULL;
 static TaintStore store;
 
 /* Shadow of IA32 General Purpose Registers */
@@ -77,17 +80,28 @@ inline static void write_log(void *drcontext, const char *szLog)
     write_log(pData, szLog);
 }
 
+// Get the pointer to the flags block in the 2-D array
 inline static uint8_t* get_shadow_ptr(uint32_t addr)
 {
-    uint8_t** shadow_pp = &shblk[(addr >> 16) & 0xffff];
-    
-    if (!(*shadow_pp)) /* shadow block has not been allocated */
+    // Lazy allocation; probably not of any use for tainted programs.
+    // However, will save something for programs that don't load tainted files.
+    if (shblk == NULL)
     {
-        *shadow_pp = (uint8_t*) malloc(0xffff * sizeof(uint8_t));
-        memset(*shadow_pp, 0, 0xffff * sizeof(uint8_t));
+	shblk = (uint8_t **) dr_global_alloc(0xffff * sizeof(uint8_t*));
+	memset(shblk, 0, 0xffff * sizeof(uint8_t*));
     }
-        
-    return &((*shadow_pp)[(addr & 0xffff)]);
+
+    uint16_t ho_idx = (uint16_t) ((addr >> 16) & 0xffff);
+    uint8_t* lo_blk = shblk[ho_idx];
+    if (lo_blk == NULL)
+    {
+	lo_blk = (uint8_t *) dr_global_alloc(0xffff * sizeof(uint8_t));
+	memset(lo_blk, 0, 0xffff * sizeof(uint8_t));
+	shblk[ho_idx] = lo_blk;
+    }
+    
+    uint16_t lo_idx = (uint16_t) addr;
+    return &(lo_blk[lo_idx]);
 }
 
 DR_EXPORT void 
@@ -102,7 +116,7 @@ dr_init(client_id_t id)
 
     tlsIdx = drmgr_register_cls_field(event_thread_context_init, event_thread_context_exit);
     
-    memset(shblk, 0, 0xffff * sizeof(uint8_t*));
+    //memset(shblk, 0, 0xffff * sizeof(uint8_t*));
 }
 
 DR_EXPORT void 
@@ -111,6 +125,8 @@ event_thread_context_init(void *drcontext, bool new_depth)
     if (new_depth) 
     {
 	SThreadData *pData = (SThreadData *) dr_thread_alloc(drcontext, sizeof(SThreadData));
+	pData->m_rgArgs = NULL;
+	pData->m_bTainted = false;
 	pData->m_logger.Initialize(LOGGER_FILE);
 	drmgr_set_cls_field(drcontext, tlsIdx, pData);
     }
@@ -130,6 +146,9 @@ DR_EXPORT void
 event_exit(void)
 {
     dr_fprintf(STDERR, "Tainted locations:\n");
+    if (shblk == NULL)
+	goto dr_uninit;
+
     for (uint16_t hi=0; hi<0xffff; ++hi)
     {
         if (!shblk[hi]) continue;
@@ -137,10 +156,11 @@ event_exit(void)
         for (uint16_t lo=0; lo<0xffff; ++lo)
         {
             if (shblk[hi][lo])
-                dr_fprintf(STDERR, "0x%04x%04x\n", hi, lo);
+                dr_fprintf(STDERR, "0x%04x%04x, ", hi, lo);
         }
     }
 
+ dr_uninit:
     drmgr_unregister_cls_field(event_thread_context_init,
 			       event_thread_context_exit,
 			       tlsIdx);
@@ -200,6 +220,48 @@ static bool event_pre_open(void *drcontext)
     return true;
 }
 
+static bool event_pre_close(void *drcontext)
+{
+    int fid = (int) dr_syscall_get_param(drcontext, 0);
+    std::set<int>::iterator iter = taintedFiles.find(fid);
+    if (iter == taintedFiles.end())
+	return true;
+
+    taintedFiles.erase(iter);
+#ifdef __DEBUG
+    dr_fprintf(STDERR, "[DLP][event_pre_close] Closing fid = %d\n", fid);
+#endif
+    return true;
+}
+
+static bool event_pre_mmap(void *drcontext)
+{
+    // Between open and close, this call can allocate memory to play with.
+    // But do we need to really do anything here; probably not
+}
+
+static bool event_pre_read(void *drcontext)
+{
+    reg_t fid = dr_syscall_get_param(drcontext, 0);
+    if (taintedFiles.find((int) fid) == taintedFiles.end())
+	return true;
+
+    SThreadData *pData = (SThreadData *) drmgr_get_cls_field(drcontext, tlsIdx);
+    if (pData == NULL)
+    {
+	dr_fprintf(STDERR, "[DLP][event_pre_read] ERR: Thread local storage is not set up\n");
+	return true;
+    }
+
+    // Array of three; add to TLS to get sent to the post event
+    pData->m_rgArgs = (reg_t *) dr_thread_alloc(drcontext, 3 * sizeof(reg_t));
+    pData->m_rgArgs[0] = fid;
+    pData->m_rgArgs[1] = dr_syscall_get_param(drcontext, 1);
+    pData->m_rgArgs[2] = dr_syscall_get_param(drcontext, 2);
+
+    return true;
+}
+
 static bool event_post_open(void *drcontext)
 {
     SThreadData *pData = (SThreadData *) drmgr_get_cls_field(drcontext, tlsIdx);
@@ -218,10 +280,42 @@ static bool event_post_open(void *drcontext)
     if (fid == -1)
 	return true;
 
-    taintedFiles.push_back(fid);
+    taintedFiles.insert(fid);
 #ifdef __DEBUG
     dr_fprintf(STDERR, "[DLP][event_post_open] DEBUG: Added file to tainted list; fid = %d\n", fid);
 #endif
+    return true;
+}
+
+static bool event_post_read(void *drcontext)
+{
+    SThreadData *pData = (SThreadData *) drmgr_get_cls_field(drcontext, tlsIdx);
+    if (pData == NULL)
+    {
+	dr_fprintf(STDERR, "[DLP][event_post_read] ERR: Thread local storage is not set up\n");
+	return true;
+    }
+
+    if (pData->m_rgArgs == NULL)
+    {
+	// Nothing to do; not tainted
+	return true;
+    }
+
+    ssize_t bytesRead = (ssize_t) dr_syscall_get_result(drcontext);
+    void *buf = (void *) pData->m_rgArgs[1];
+    for (int i = 0; i < bytesRead; i++)
+    {
+	// Set to shadow table
+	uint32_t addr = (uint32_t) (buf + i);
+	uint8_t* pFlags = get_shadow_ptr(addr);
+	*pFlags = 1;
+    }
+
+    // clear the pData's args
+    dr_thread_free(drcontext, pData->m_rgArgs, sizeof(reg_t) * 3);
+    pData->m_rgArgs = NULL;
+
     return true;
 }
 
@@ -232,6 +326,10 @@ event_pre_syscall(void *drcontext, int sysnum)
     {
     case SYS_open:
 	return event_pre_open(drcontext);
+    case SYS_close:
+	return event_pre_close(drcontext);
+    case SYS_read:
+	return event_pre_read(drcontext);
     }
     
     return true;    
@@ -244,6 +342,9 @@ event_post_syscall(void *drcontext, int sysnum)
     {
     case SYS_open:
 	event_post_open(drcontext);
+	return;
+    case SYS_read:
+	event_post_read(drcontext);
 	return;
     }
 }
