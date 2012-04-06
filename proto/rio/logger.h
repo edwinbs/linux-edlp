@@ -5,7 +5,7 @@
 #include "dr_api.h"
 #include "drmgr.h"
 
-#define LOGGER_FILE "/home/vivek/Desktop/audit/dlp.log"
+#define LOGGER_FILE "/home/vivek/Desktop/dlp/audit.log"
 
 class Logger
 {
@@ -38,7 +38,7 @@ public:
 	m_file = dr_open_file(szFilename, DR_FILE_WRITE_APPEND);
 	if (m_file == INVALID_FILE)
 	{
-	    dr_fprintf(STDERR, "File could not be opened");
+	    dr_fprintf(STDERR, "[DLP][Logger::Initialize] ERR: File %s could not be opened\n", szFilename);
 	    return false;
 	}
 	
@@ -49,7 +49,7 @@ public:
     {
 	if (m_file == INVALID_FILE)
 	{
-	    dr_fprintf(STDERR, "No file; %s", szLog);
+	    dr_fprintf(STDERR, "[DLP][Logger::WriteLog] ERR: No file; %s\n", szLog);
 	    return;
 	}
 	//dr_fprintf(STDERR, "No file; %s", szLog);

@@ -16,6 +16,7 @@
 #include <stdint.h>
 #include <vector>
 #include "logger.h"
+#include "persistence.h"
 
 using namespace std;
 //aa
@@ -42,6 +43,7 @@ static std::vector<int> taintedFiles;
 /* 64K blocks of 64KB each. shblk[] contain the pointer to the real blocks. */
 /* Note that the block pointers consume (64 * 4 = 256) KB */
 static uint8_t* shblk[0xffff];
+static TaintStore store;
 
 /* Shadow of IA32 General Purpose Registers */
 static uint8_t shgpr[8];
@@ -167,43 +169,9 @@ is_external(const string& sFileName)
     return (sFileName.find("/media/") != string::npos);
 }
 
-static bool is_confidential(const string& sFileName)
+static bool is_confidential(const char* szFileName)
 {
-    // TODO: To be extended to make this customizable
-    return (sFileName.find("confidential") != string::npos);
-}
-
-static bool
-on_open(const string& sFileName, bool bWrite)
-{
-    if (is_tainted && bWrite && is_external(sFileName))
-    {
-        dr_fprintf(STDERR, "[DLP] BLOCKED write: %s\n", sFileName.c_str());
-        return false;
-    }
-
-    if (sFileName.find("confidential") != string::npos)
-    {
-        is_tainted = true;
-    }
-        
-    return true;
-}
-
-static void
-post_read(int fd, void* buf, size_t count, ssize_t bytes_read)
-{
-    if (is_tainted)
-    {
-        printf("Tainted load % 4d bytes to 0x%08x\n",
-            bytes_read, (uint32_t) buf);
-            
-        for (ssize_t i = 0; i < bytes_read; ++i)
-        {       
-            uint8_t* shadow_ptr = get_shadow_ptr((uint32_t) buf + i);
-            *shadow_ptr = 1;
-        }
-    }
+    return (store.CheckTainted(szFileName));
 }
 
 static bool event_pre_open(void *drcontext)
