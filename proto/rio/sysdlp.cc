@@ -15,6 +15,7 @@
 #include <string>
 #include <stdint.h>
 #include <set>
+#include <map>
 #include "logger.h"
 #include "persistence.h"
 
@@ -23,15 +24,17 @@ using namespace std;
 # define __DEBUG
 # define DISPLAY_STRING(msg) dr_printf("%s\n", msg);
 # define ATOMIC_INC(var) __asm__ __volatile__("lock incl %0" : "=m" (var) : : "memory")
-
+# define FILE_TYPE_NORMAL   0
+# define FILE_TYPE_TAINTED  1
+# define FILE_TYPE_EXTERNAL 2
 struct SThreadData
 {
     Logger m_logger;
-    bool m_bTainted;
+    int m_iFileType;
     reg_t* m_rgArgs;
 
     SThreadData()
-	: m_bTainted(false)
+	: m_iFileType(FILE_TYPE_NORMAL)
 	, m_rgArgs(NULL)
     {
 	//m_logger.Initialize(LOGGER_FILE);
@@ -40,8 +43,13 @@ struct SThreadData
 
 // The index for thread local storage
 static int tlsIdx;
+// List of all open files
+static std::map<int, std::string> openFiles;
 // List of tainted files loaded in the process; any buffers loaded from these files will be marked tainted
 static std::set<int> taintedFiles;
+// List of external files loaded in the process; tainted buffers should not be written to these
+// This will not work when programs use SYS_rename instead of SYS_write
+static std::set<int> externalFiles;
 /* Shadow memory (32-bit) */
 /* 64K blocks of 64KB each. shblk[] contain the pointer to the real blocks. */
 /* Note that the block pointers consume (64 * 4 = 256) KB */
@@ -104,6 +112,20 @@ inline static uint8_t* get_shadow_ptr(uint32_t addr)
     return &(lo_blk[lo_idx]);
 }
 
+inline static bool is_tainted_buf(void *buf, size_t size)
+{
+    void *ptr = buf;
+    for (int i = 0; i < size; i++, ptr = ptr + 1)
+    {	
+	uint32_t addr = (uint32_t) ptr;
+	uint8_t *pFlags = get_shadow_ptr(addr);
+	if (*pFlags == 1)
+	    return true;
+    }
+
+    return false;
+}
+
 DR_EXPORT void 
 dr_init(client_id_t id)
 {
@@ -126,7 +148,7 @@ event_thread_context_init(void *drcontext, bool new_depth)
     {
 	SThreadData *pData = (SThreadData *) dr_thread_alloc(drcontext, sizeof(SThreadData));
 	pData->m_rgArgs = NULL;
-	pData->m_bTainted = false;
+	pData->m_iFileType = FILE_TYPE_NORMAL;
 	pData->m_logger.Initialize(LOGGER_FILE);
 	drmgr_set_cls_field(drcontext, tlsIdx, pData);
     }
@@ -203,34 +225,64 @@ static bool event_pre_open(void *drcontext)
 	return true;
     }
 
-    const char *szFileName = (const char*) dr_syscall_get_param(drcontext, 0);
-    //write_log(pData, szFileName);
-    if (!is_confidential(szFileName))
+    reg_t fileArg = dr_syscall_get_param(drcontext, 0);
+    pData->m_rgArgs = (reg_t *) dr_thread_alloc(drcontext, 1 * sizeof(reg_t));
+    pData->m_rgArgs[0] = fileArg;
+
+    const char *szFileName = (const char*) fileArg;
+    if (is_confidential(szFileName))
     {
-	pData->m_bTainted = false;
+	pData->m_iFileType = FILE_TYPE_TAINTED;
+	
+	char buffer[500];
+	sprintf(buffer, "[DLP] Confidential file about to be opened: %s\n", szFileName);
+	write_log(pData, buffer);
+
 	return true;
     }
 
-    pData->m_bTainted = true;
+    if (is_external(szFileName))
+    {
+	pData->m_iFileType = FILE_TYPE_EXTERNAL;
     
-    char buffer[200];
-    sprintf(buffer, "[DLP] Confidential file about to be opened: %s", szFileName);
-    write_log(pData, buffer);
+	char buffer[500];
+	sprintf(buffer, "[DLP] External file about to be opened: %s\n", szFileName);
+	write_log(pData, buffer);
+	
+	return true;
+    }
 
+    pData->m_iFileType = FILE_TYPE_NORMAL;
+    
     return true;
 }
 
 static bool event_pre_close(void *drcontext)
 {
     int fid = (int) dr_syscall_get_param(drcontext, 0);
-    std::set<int>::iterator iter = taintedFiles.find(fid);
-    if (iter == taintedFiles.end())
-	return true;
+    // TODO: We assume the file will close; is a flawed assumption; will consider moving this to post_call
+    openFiles.erase(fid);
 
-    taintedFiles.erase(iter);
+    std::set<int>::iterator iter = taintedFiles.find(fid);
+    if (iter != taintedFiles.end())
+    {
+	taintedFiles.erase(iter);
 #ifdef __DEBUG
-    dr_fprintf(STDERR, "[DLP][event_pre_close] Closing fid = %d\n", fid);
+	dr_fprintf(STDERR, "[DLP][event_pre_close] DEBUG: Closing tainted fid = %d\n", fid);
 #endif
+	return true;
+    }
+
+    iter = externalFiles.find(fid);
+    if (iter != externalFiles.end())
+    {
+	externalFiles.erase(iter);
+#ifdef __DEBUG
+	dr_fprintf(STDERR, "[DLP][event_pre_close] DEBUG: Closing external fid = %d\n", fid);
+#endif
+	return true;
+    }
+    
     return true;
 }
 
@@ -262,6 +314,48 @@ static bool event_pre_read(void *drcontext)
     return true;
 }
 
+static bool event_pre_write(void *drcontext)
+{
+    reg_t fid = dr_syscall_get_param(drcontext, 0);
+    // If the file is already tainted, just proceed
+    if (taintedFiles.find((int) fid) != taintedFiles.end())
+	return true;
+
+    // Check if the fid is in the open files list
+    std::map<int, std::string>::iterator mapIter = openFiles.find((int) fid);
+    if (mapIter == openFiles.end())
+    {
+	dr_fprintf(STDERR, "[DLP][event_pre_write] ERR: This is unnatural; writing to a file that was never opened; fid = %d\n", fid);
+	return true;
+    }
+
+    // Check if there is tainted buf
+    reg_t buf = dr_syscall_get_param(drcontext, 1);
+    reg_t size = dr_syscall_get_param(drcontext, 2);
+    if (!is_tainted_buf((void *) buf, (size_t) size))
+    {
+	// Nothing to do; just return
+	return true;
+    }
+
+    // If the file is external and trying to write tainted buffer, block
+    if (externalFiles.find((int) fid) != externalFiles.end())
+    {
+	char buffer[500];
+	sprintf(buffer, "[DLP] Trying to write sensitive data to external location; filename = %s\n",
+		mapIter->second.c_str());
+	write_log(drcontext, buffer);
+	 
+	// Block write
+	return false;
+    }
+
+    // Add the file to the tainted list
+    store.AddTainted(mapIter->second.c_str());
+    
+    return true;
+}
+
 static bool event_post_open(void *drcontext)
 {
     SThreadData *pData = (SThreadData *) drmgr_get_cls_field(drcontext, tlsIdx);
@@ -271,19 +365,40 @@ static bool event_post_open(void *drcontext)
 	return true;
     }
 
-    if (!pData->m_bTainted)
-	return true;
-
-    pData->m_bTainted = false;
-    
     int fid = (int) dr_syscall_get_result(drcontext);
     if (fid == -1)
 	return true;
 
-    taintedFiles.insert(fid);
+    // Regardless of file type, add to openFiles map
+    openFiles.insert(pair<int, std::string>(fid, (const char *) pData->m_rgArgs[0]));
+    
+    dr_thread_free(drcontext, pData->m_rgArgs, 1 * sizeof(reg_t));
+    pData->m_rgArgs = NULL;
+
+    if (pData->m_iFileType == FILE_TYPE_NORMAL)
+	return true;
+
+    int iFileType = pData->m_iFileType;
+    pData->m_iFileType = FILE_TYPE_NORMAL;
+    
+    if (iFileType == FILE_TYPE_TAINTED)
+    {
+	taintedFiles.insert(fid);
 #ifdef __DEBUG
-    dr_fprintf(STDERR, "[DLP][event_post_open] DEBUG: Added file to tainted list; fid = %d\n", fid);
+	dr_fprintf(STDERR, "[DLP][event_post_open] DEBUG: Added file to tainted list; fid = %d\n", fid);
 #endif
+	return true;
+    }
+
+    if (iFileType == FILE_TYPE_EXTERNAL)
+    {
+	externalFiles.insert(fid);
+#ifdef __DEBUG
+	dr_fprintf(STDERR, "[DLP][event_post_open] DEBUG: Added file to external list; fid = %d\n", fid);
+#endif
+	return true;
+    }
+
     return true;
 }
 
@@ -330,6 +445,8 @@ event_pre_syscall(void *drcontext, int sysnum)
 	return event_pre_close(drcontext);
     case SYS_read:
 	return event_pre_read(drcontext);
+    case SYS_write:
+	return event_pre_write(drcontext);
     }
     
     return true;    
