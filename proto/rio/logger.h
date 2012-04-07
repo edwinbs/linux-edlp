@@ -53,7 +53,7 @@ public:
 	    return;
 	}
 	//dr_fprintf(STDERR, "No file; %s", szLog);
-	ssize_t numWritten = dr_write_file(m_file, szLog, strlen(szLog) + 1);
+	ssize_t numWritten = dr_write_file(m_file, szLog, strlen(szLog));
 	return;
     }
 };

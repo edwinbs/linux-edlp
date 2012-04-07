@@ -23,6 +23,9 @@ struct SThreadData
 // The index for thread local storage
 static int tlsIdx;
 
+// Shadow memory mutex
+static void *shblkMutex;
+
 /* Shadow memory (32-bit) */
 /* 64K blocks of 64KB each. shblk[] contain the pointer to the real blocks. */
 /* Note that the block pointers consume (64 * 4 = 256) KB */
@@ -67,4 +70,40 @@ inline static bool is_tainted_buf(void *buf, size_t size)
     }
 
     return false;
+}
+
+inline static void set_tainted_buf(void *buf, size_t size)
+{
+    dr_mutex_lock(shblkMutex);
+
+    void *ptr = buf;
+    for (size_t i = 0; i < size; i++, ptr = ptr + 1)
+    {
+	uint32_t addr = (uint32_t) ptr;
+	uint8_t *pFlags = get_shadow_ptr(addr);
+	if (pFlags == NULL)
+	    continue;
+
+	*pFlags = 1;
+    }
+    
+    dr_mutex_unlock(shblkMutex);
+}
+
+inline static void reset_tainted_buf(void *buf, size_t size)
+{
+    dr_mutex_lock(shblkMutex);
+
+    void *ptr = buf;
+    for (size_t i = 0; i < size; i++, ptr = ptr + 1)
+    {
+	uint32_t addr = (uint32_t) ptr;
+	uint8_t *pFlags = get_shadow_ptr(addr);
+	if (pFlags == NULL)
+	    continue;
+
+	*pFlags = 0;
+    }
+
+    dr_mutex_unlock(shblkMutex);
 }

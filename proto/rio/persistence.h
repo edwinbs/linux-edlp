@@ -42,13 +42,13 @@ private:
     {
 	if (m_taintFile == INVALID_FILE)
 	{
-	    dr_fprintf(STDERR, "Taint file has not been initialized\n");
+	    dr_fprintf(STDERR, "[DLP][LoadData] ERR: Taint file has not been initialized\n");
 	    return;
 	}
 	
-	if (!dr_mutex_trylock(m_fileNamesMutex))
+	if (!dr_rwlock_write_trylock(m_fileNamesMutex))
 	{
-	    dr_fprintf(STDERR, "Could not acquire mutex to refresh the tainted store\n");
+	    dr_fprintf(STDERR, "[DLP][LoadData] ERR: Could not acquire write lock to refresh the tainted store\n");
 	    return;
 	}
 
@@ -57,7 +57,7 @@ private:
 	if (!dr_file_seek(m_taintFile, 0, DR_SEEK_END))
 	{
 	    dr_fprintf(STDERR, "dr_file_seek to end failed\n");
-	    dr_mutex_unlock(m_fileNamesMutex);
+	    dr_rwlock_write_unlock(m_fileNamesMutex);
 	    return;
 	}
 	
@@ -65,7 +65,7 @@ private:
 	if (iEnd <= 0)
 	{
 	    //dr_fprintf(STDERR, "The taint file is empty\n");
-	    dr_mutex_unlock(m_fileNamesMutex);
+	    dr_rwlock_write_unlock(m_fileNamesMutex);
 	    return;
 	}
 
@@ -75,7 +75,7 @@ private:
 	if (!buf)
 	{
 	    dr_fprintf(STDERR, "The buffer could not be allocated; size = %d", iEnd);
-	    dr_mutex_unlock(m_fileNamesMutex);
+	    dr_rwlock_write_unlock(m_fileNamesMutex);
 	    return;
 	}
 
@@ -84,7 +84,7 @@ private:
 	{
 	    dr_global_free(buf, iEnd);
 	    dr_fprintf(STDERR, "No bytes read from the taint file\n");
-	    dr_mutex_unlock(m_fileNamesMutex);
+	    dr_rwlock_write_unlock(m_fileNamesMutex);
 	    return;
 	}
 	
@@ -107,7 +107,7 @@ private:
 	if (buf)
 	    dr_global_free(buf, iEnd);
 
-	dr_mutex_unlock(m_fileNamesMutex);
+	dr_rwlock_write_unlock(m_fileNamesMutex);
     }
 
 public:
@@ -115,13 +115,13 @@ public:
 	: m_taintFile(INVALID_FILE)
     {
 	Initialize(TAINT_FILE);
-	m_fileNamesMutex = dr_mutex_create();
+	m_fileNamesMutex = dr_rwlock_create();
 	LoadData();
     }
 
     ~TaintStore()
     {
-	dr_mutex_destroy(m_fileNamesMutex);
+	dr_rwlock_destroy(m_fileNamesMutex);
 	Uninitialize();
     }
 
@@ -130,8 +130,11 @@ public:
 	if (szFileName == NULL)
 	    return false;
 
-	// TODO: reader semaphore needed; lock makes things too slow
-	return (m_fileNames.find(szFileName) != m_fileNames.end());
+	dr_rwlock_read_lock(m_fileNamesMutex);
+	bool result = (m_fileNames.find(szFileName) != m_fileNames.end());
+	dr_rwlock_read_unlock(m_fileNamesMutex);
+
+	return result;
     }
 
     void RefreshStore()
@@ -154,10 +157,16 @@ public:
 	char buff[MAX_FILE];
 	sprintf(buff, "%s\n", szFileName);
 
-	dr_mutex_lock(m_fileNamesMutex);
+	dr_rwlock_write_lock(m_fileNamesMutex);
+	dr_file_seek(m_taintFile, 0, DR_SEEK_END);
 	dr_write_file(m_taintFile, buff, len + 1);
-	dr_mutex_unlock(m_fileNamesMutex);
+	dr_rwlock_write_unlock(m_fileNamesMutex);
 
 	LoadData();
+    }
+
+    void RemoveTainted(const char *szFileName)
+    {
+	// TODO: Implement
     }
 };
