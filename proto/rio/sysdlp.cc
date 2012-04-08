@@ -30,19 +30,24 @@ static dr_emit_flags_t event_basic_block(void *drcontext, void *tag, instrlist_t
                                          bool for_trace, bool translating);
 static void event_thread_context_init(void *drcontext, bool new_depth);
 static void event_thread_context_exit(void *drcontext, bool process_exit);
+// drwrap stuff
+static void event_module_load(void *drcontext, const module_data_t *mod, bool loaded);
 
 DR_EXPORT void 
 dr_init(client_id_t id)
 {
     drmgr_init();
+    bool result = drwrap_init();
+    dr_printf("drwrap_init result = %d\n", result);
     dr_register_filter_syscall_event(event_filter_syscall);
     drmgr_register_pre_syscall_event(event_pre_syscall);
     dr_register_post_syscall_event(event_post_syscall);
     dr_register_exit_event(event_exit);
+    dr_register_module_load_event(event_module_load);
     //dr_register_bb_event(event_basic_block);
 
     tlsIdx = drmgr_register_cls_field(event_thread_context_init, event_thread_context_exit);
-
+    //dr_fprintf(STDERR, "In dr_init");
     // Init the shadow block mutex
     shblkMutex = dr_mutex_create();
 }
@@ -103,6 +108,7 @@ event_exit(void)
     drmgr_unregister_cls_field(event_thread_context_init,
 			       event_thread_context_exit,
 			       tlsIdx);
+    drwrap_exit();
     drmgr_exit();
 }
 
@@ -182,3 +188,15 @@ event_basic_block(void *drcontext, void *tag, instrlist_t *bb,
 {
     return DR_EMIT_DEFAULT;
 }
+
+static void event_module_load(void *drcontext, const module_data_t *mod, bool loaded)
+{
+    //dr_fprintf(STDERR, "Full path: %s\n", mod->full_path);
+    app_pc memcpywrap = (app_pc) dr_get_proc_address(mod->start, "memcpy");
+    if (memcpywrap != NULL)
+    {
+	bool result = drwrap_wrap(memcpywrap, wrap_pre_memcpy, NULL);
+	dr_fprintf(STDERR, "In event_module_load; memcpywrap result = %d\n", result);
+    }
+}
+

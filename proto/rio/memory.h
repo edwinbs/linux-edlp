@@ -58,25 +58,25 @@ inline static uint8_t* get_shadow_ptr(uint32_t addr)
     return &(lo_blk[lo_idx]);
 }
 
-inline static bool is_tainted_buf(void *buf, size_t size)
+inline static bool is_tainted_buf(const void *buf, size_t size, bool bGlobalTaint = false)
 {
-    void *ptr = buf;
+    void *ptr = (void *) buf;
     for (int i = 0; i < size; i++, ptr = ptr + 1)
     {	
 	uint32_t addr = (uint32_t) ptr;
 	uint8_t *pFlags = get_shadow_ptr(addr);
-	if (*pFlags == 1)
+	if (*pFlags == 1 || (bGlobalTaint && *pFlags == 2))
 	    return true;
     }
 
     return false;
 }
 
-inline static void set_tainted_buf(void *buf, size_t size)
+inline static void set_tainted_buf(const void *buf, size_t size, int flags = 1)
 {
     dr_mutex_lock(shblkMutex);
 
-    void *ptr = buf;
+    void *ptr = (void *) buf;
     for (size_t i = 0; i < size; i++, ptr = ptr + 1)
     {
 	uint32_t addr = (uint32_t) ptr;
@@ -84,17 +84,17 @@ inline static void set_tainted_buf(void *buf, size_t size)
 	if (pFlags == NULL)
 	    continue;
 
-	*pFlags = 1;
+	*pFlags = flags;
     }
     
     dr_mutex_unlock(shblkMutex);
 }
 
-inline static void reset_tainted_buf(void *buf, size_t size)
+inline static void reset_tainted_buf(const void *buf, size_t size)
 {
     dr_mutex_lock(shblkMutex);
 
-    void *ptr = buf;
+    void *ptr = (void *) buf;
     for (size_t i = 0; i < size; i++, ptr = ptr + 1)
     {
 	uint32_t addr = (uint32_t) ptr;

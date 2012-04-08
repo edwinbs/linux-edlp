@@ -1,6 +1,7 @@
 #pragma once
 
 #define __DEBUG
+//#define __GLOBAL_TAINT
 
 #include <string>
 #include <stdint.h>
@@ -12,8 +13,12 @@
 
 #include "dr_api.h"
 #include "drmgr.h"
+#include "drwrap.h"
 #include "util.h"
 #include "persistence.h"
+
+// Global tainted flag; should be set only if __GLOBAL_TAINT is enabled
+static bool g_bTainted;
 
 // List of all open files
 static std::map<int, std::string> openFiles;
@@ -29,12 +34,20 @@ static bool
 is_external(const std::string& sFileName)
 {
     // TODO: To be extended to include network
-    return (sFileName.find("/media/") != std::string::npos);
+    return (sFileName.find("/media/") != std::string::npos || 
+	    sFileName.find("smb://") != std::string::npos || 
+	    sFileName.find("ftp://") != std::string::npos ||
+	    sFileName.find("http://") != std::string::npos);
 }
 
 static bool is_confidential(const char* szFileName)
 {
     return (store.CheckTainted(szFileName));
+}
+
+static bool is_tainted(const char *szFileName)
+{
+    return (g_bTainted || store.CheckTainted(szFileName));
 }
 
 static bool event_pre_open(void *drcontext)
@@ -58,18 +71,13 @@ static bool event_pre_open(void *drcontext)
 	char buffer[500];
 	sprintf(buffer, "[DLP] Confidential file about to be opened: %s\n", szFileName);
 	write_log(pData, buffer);
-
+		
 	return true;
     }
 
     if (is_external(szFileName))
     {
 	pData->m_iFileType = FILE_TYPE_EXTERNAL;
-    
-	char buffer[500];
-	sprintf(buffer, "[DLP] External file about to be opened: %s\n", szFileName);
-	write_log(pData, buffer);
-	
 	return true;
     }
 
@@ -105,6 +113,9 @@ static bool event_post_open(void *drcontext)
     
     if (iFileType == FILE_TYPE_TAINTED)
     {
+#ifdef __GLOBAL_TAINT
+	g_bTainted = true;
+#endif
 	taintedFiles.insert(fid);
 #ifdef __DEBUG
 	dr_fprintf(STDERR, "[DLP][event_post_open] DEBUG: Added file to tainted list; fid = %d\n", fid);
@@ -162,13 +173,11 @@ static bool event_pre_mmap(void *drcontext)
 	return true;
     }
     
-    pData->m_rgArgs = NULL;
-
-    // Between open and close, this call can allocate memory to play with.
     reg_t fid = dr_syscall_get_param(drcontext, 4);
     reg_t flags = dr_syscall_get_param(drcontext, 3);
     if (fid == (int) -1 && flags == MAP_ANONYMOUS | MAP_PRIVATE)
     {
+#ifdef __GLOBAL_TAINT
 	// Text editors like EMACS use buffers instead of actual files. The user updates
 	// the buffer which is then written back to a temp file and that is then renamed 
 	// to the user's file. This is a smart concept that allows for multiple buffers for
@@ -180,11 +189,14 @@ static bool event_pre_mmap(void *drcontext)
 	// The downside is that these programs become always-tainted programs if any changes are made.
 	// Possible improvement: program specific policies that tell us when tainted buffers get loaded.
 	
-	pData->m_rgArgs = (reg_t *) dr_thread_alloc(drcontext, 1 * sizeof(reg_t));
-	memset(pData->m_rgArgs, 0, 1 * sizeof(reg_t));
+	// Too many false positives, so taking this out
+	/*pData->m_rgArgs = (reg_t *) dr_thread_alloc(drcontext, 2 * sizeof(reg_t));
+	memset(pData->m_rgArgs, 0, 2 * sizeof(reg_t));
 	pData->m_rgArgs[0] = dr_syscall_get_param(drcontext, 1); // length
-
+	pData->m_rgArgs[1] = fid;*/
+#endif
 	return true;
+
     }
 
     if (taintedFiles.find(fid) == taintedFiles.end())
@@ -195,7 +207,13 @@ static bool event_pre_mmap(void *drcontext)
 	return true;
     }
 
+    pData->m_rgArgs = (reg_t *) dr_thread_alloc(drcontext, 2 * sizeof(reg_t));
+    memset(pData->m_rgArgs, 0, 2 * sizeof(reg_t));
+    pData->m_rgArgs[0] = dr_syscall_get_param(drcontext, 1); // length
+    pData->m_rgArgs[1] = fid;
+
     dr_fprintf(STDERR, "Creating an mmap of fid = %d\n", fid);
+
     return true;
 }
 
@@ -217,16 +235,18 @@ static bool event_post_mmap(void *drcontext)
     void *buf = (void *) dr_syscall_get_result(drcontext);
     if (buf == MAP_FAILED)
     {
-	dr_thread_free(drcontext, pData->m_rgArgs, sizeof(reg_t) * 1);
+	dr_thread_free(drcontext, pData->m_rgArgs, sizeof(reg_t) * 2);
 	pData->m_rgArgs = NULL;
 	return true;
     }
 
     size_t length = (size_t) pData->m_rgArgs[0];
+    int fid = (int) pData->m_rgArgs[1];
     
-    set_tainted_buf(buf, length);
+    // Taint flag 2 means it may be tainted, but we aren't sure yet
+    set_tainted_buf(buf, length, ((fid == -1) ? 2 : 1));
 
-    dr_thread_free(drcontext, pData->m_rgArgs, sizeof(reg_t) * 1);
+    dr_thread_free(drcontext, pData->m_rgArgs, sizeof(reg_t) * 2);
     pData->m_rgArgs = NULL;
     return true;
 }
@@ -289,8 +309,9 @@ static bool event_post_read(void *drcontext)
     ssize_t bytesRead = (ssize_t) dr_syscall_get_result(drcontext);
     void *buf = (void *) pData->m_rgArgs[1];
 
-    dr_fprintf(STDERR, "[DLP][event_post_read] Going to set tainted buf; buf = %p, length = %d\n", 
-	       buf, bytesRead);
+    if ((int) bytesRead == 6 && strcmp((const char *) buf, "hello\n") == 0)
+	dr_fprintf(STDERR, "[DLP] Read Address = %p\n", (const char *) buf);
+
     set_tainted_buf(buf, bytesRead);
 
     // clear the pData's args
@@ -317,7 +338,10 @@ static bool event_pre_write(void *drcontext)
     // Check if there is tainted buf
     reg_t buf = dr_syscall_get_param(drcontext, 1);
     reg_t size = dr_syscall_get_param(drcontext, 2);
-    if (!is_tainted_buf((void *) buf, (size_t) size))
+
+    if ((int) size < 10)
+	dr_fprintf(STDERR, "[DLP] Write Address = %p %s\n", (const char *) buf, (const char *) buf);
+    if (!is_tainted_buf((void *) buf, (size_t) size, g_bTainted))
     {
 	// Nothing to do; just return
 	return true;
@@ -327,7 +351,7 @@ static bool event_pre_write(void *drcontext)
     if (externalFiles.find((int) fid) != externalFiles.end())
     {
 	char buffer[500];
-	sprintf(buffer, "[DLP] Trying to write sensitive data to external location; filename = %s\n",
+	sprintf(buffer, "[DLP] BLOCKED: Not allowed to write sensitive data to external location; filename = %s\n",
 		mapIter->second.c_str());
 	write_log(drcontext, buffer);
 	 
@@ -417,16 +441,17 @@ static bool event_pre_rename(void *drcontext)
 
     reg_t oldFile = dr_syscall_get_param(drcontext, 0);
     reg_t newFile = dr_syscall_get_param(drcontext, 1);
-    if (is_external((const char *) newFile))
+    bool isTainted = is_tainted((const char *) oldFile);
+    if (isTainted && is_external((const char *) newFile))
     {
 	char buffer[500];
-	sprintf(buffer, "[DLP] Trying to write sensitive data to external location; filename = %s\n",
+	sprintf(buffer, "[DLP] BLOCKED: Not allowed to write sensitive data to external location; filename = %s\n",
 		(const char *) newFile);
 	write_log(drcontext, buffer);
 	return false;
     }
 
-    if (!store.CheckTainted((const char *) oldFile))
+    if (!isTainted)
 	return true;
 
     pData->m_rgArgs = (reg_t *) dr_thread_alloc(drcontext, 2 * sizeof(reg_t));
@@ -450,9 +475,17 @@ static bool event_post_rename(void *drcontext)
 	return true;
     }
 
+    if (!store.CheckTainted((const char *) pData->m_rgArgs[0]))
+    {
+	dr_thread_free(drcontext, pData->m_rgArgs, 2 * sizeof(reg_t));
+	pData->m_rgArgs = NULL;
+	return true;
+    }
+
     dr_fprintf(STDERR, "[DLP][event_post_rename] Removing %s; Adding %s\n", 
 	       (const char *) pData->m_rgArgs[0],
 	       (const char *) pData->m_rgArgs[1]);
+
     store.RemoveTainted((const char *) pData->m_rgArgs[0]);
     store.AddTainted((const char *) pData->m_rgArgs[1]);
     
@@ -460,4 +493,54 @@ static bool event_post_rename(void *drcontext)
     pData->m_rgArgs = NULL;
 
     return true;
+}
+
+static void wrap_pre_memcpy(void *wrapcxt, OUT void **user_data)
+{
+    void *dst = drwrap_get_arg(wrapcxt, 0);
+    const void *src = drwrap_get_arg(wrapcxt, 1);
+    size_t num = (size_t) drwrap_get_arg(wrapcxt, 2);
+
+    if (num == 0)
+	return;
+
+    if (!is_tainted_buf(src, num))
+	return;
+
+    set_tainted_buf(dst, num);
+}
+
+static void wrap_post_memcpy(void *wrapcxt, void *user_data)
+{
+    //dr_fprintf(STDERR, "In wrap_post_memcpy\n");
+}
+
+static void wrap_pre_free(void *wrapcxt, OUT void **user_data)
+{
+    void *dst = drwrap_get_arg(wrapcxt, 0);
+}
+
+static void wrap_post_free(void *wrapcxt, void *user_data)
+{
+    dr_fprintf(STDERR, "In wrap_post_malloc\n");
+}
+
+static void wrap_pre_malloc(void *wrapcxt, OUT void **user_data)
+{
+    dr_fprintf(STDERR, "In wrap_pre_malloc\n");
+}
+
+static void wrap_post_malloc(void *wrapcxt, void *user_data)
+{
+    dr_fprintf(STDERR, "In wrap_post_malloc\n");
+}
+
+static void wrap_pre_memset(void *wrapcxt, OUT void **user_data)
+{
+    dr_fprintf(STDERR, "In wrap_pre_memset\n");
+}
+
+static void wrap_post_memset(void *wrapcxt, void *user_data)
+{
+    dr_fprintf(STDERR, "In wrap_post_memset\n");
 }
