@@ -505,7 +505,10 @@ static void wrap_pre_memcpy(void *wrapcxt, OUT void **user_data)
 	return;
 
     if (!is_tainted_buf(src, num))
+    {
+	reset_tainted_buf(dst, num);
 	return;
+    }
 
     set_tainted_buf(dst, num);
 }
